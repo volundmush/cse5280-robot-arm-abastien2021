@@ -218,10 +218,20 @@
     {
       "count": 1,
       "floor": 0,
-      "offset": [9.0, 6.0],
+      "offset": [5.0, 3.0],
       "color": "darkred",
       "strength": 8.0,
-      "radius": 0.35
+      "radius": 0.35,
+      "strategy": "intercept"
+    },
+    {
+      "count": 1,
+      "floor": 1,
+      "offset": [3.0, 3.0],
+      "color": "purple",
+      "strength": 8.0,
+      "radius": 0.35,
+      "strategy": "flow"
     }
   ]
 }

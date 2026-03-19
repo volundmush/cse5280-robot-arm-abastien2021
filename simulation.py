@@ -235,7 +235,6 @@ class AgentGroup:
 
 
 @dataclass
-@dataclass
 class HarasserGroup:
     count: int
     floor: int
@@ -243,6 +242,7 @@ class HarasserGroup:
     color: str
     strength: float
     radius: float
+    strategy: str = "intercept"
 
 
 @dataclass
@@ -478,6 +478,7 @@ class Harasser(Actor):
         radius: float,
         color: str,
         strength: float = 5.0,
+        strategy: str = "intercept",
     ):
         super().__init__()
         self.pos = pos.copy()
@@ -486,7 +487,9 @@ class Harasser(Actor):
         self.radius = radius
         self.color = color
         self.strength = strength
+        self.strategy = strategy
         self._bodies = [Body(pos=self.pos, radius=radius, owner_id=self.id)]
+        self._target_pos = self.pos[:2].copy()
 
     @property
     def x(self) -> float:
@@ -500,26 +503,69 @@ class Harasser(Actor):
     def z(self) -> float:
         return float(self.pos[2])
 
+    def _compute_target_nearest(self, evacuees: List["Evacuee"]) -> np.ndarray:
+        nearest = min(evacuees, key=lambda e: norm(self.pos[:2] - e.pos[:2]))
+        return nearest.pos[:2].copy()
+
+    def _compute_target_density(self, evacuees: List["Evacuee"], env: Environment) -> np.ndarray:
+        return _find_highest_density_point(evacuees, env.floorplan, self.pos)
+
+    def _compute_target_flow(self, evacuees: List["Evacuee"], env: Environment) -> np.ndarray:
+        return _compute_flow_target(evacuees, self.pos, env.floorplan, prediction_time=2.0)
+
+    def _compute_target_intercept(self, evacuees: List["Evacuee"], env: Environment) -> np.ndarray:
+        clusters = _find_evacuee_clusters(evacuees)
+        if not clusters:
+            return self._compute_target_nearest(evacuees)
+
+        best_target = None
+        best_score = -1.0
+
+        for centroid, velocity, size in clusters:
+            predicted_pos = centroid + velocity * 2.0
+            min_dist = min(norm(predicted_pos - g.center[:2]) for g in env.floorplan.goals)
+            urgency = 1.0 / max(min_dist, 0.5)
+            score = float(size) * urgency
+
+            if score > best_score:
+                best_score = score
+                best_target = predicted_pos
+
+        return best_target if best_target is not None else self.pos[:2].copy()
+
+    def _compute_target(self, evacuees: List["Evacuee"], env: Environment) -> np.ndarray:
+        if not evacuees:
+            return self.pos[:2].copy()
+
+        if self.strategy == "nearest":
+            return self._compute_target_nearest(evacuees)
+        elif self.strategy == "density":
+            return self._compute_target_density(evacuees, env)
+        elif self.strategy == "flow":
+            return self._compute_target_flow(evacuees, env)
+        elif self.strategy == "intercept":
+            return self._compute_target_intercept(evacuees, env)
+        else:
+            return self._compute_target_nearest(evacuees)
+
     def force(self, env: Environment, cfg: AgentConfig) -> Vector:
-        evacuees = [a for a in env.actors if isinstance(a, Evacuee) and a.active and not a.reached_goal]
+        evacuees = [a for a in env.actors if isinstance(a, Evacuee) and a.active and not a.reached_goal and a.floor_index == self.floor_index]
         if not evacuees:
             return np.zeros(3, dtype=float)
 
-        clusters = _find_evacuee_clusters(evacuees)
-        if clusters:
-            cluster_attraction = _compute_cluster_attraction(self.pos, clusters, env.floorplan) * self.strength
-        else:
-            nearest = min(evacuees, key=lambda e: norm(self.pos[:2] - e.pos[:2]))
-            delta = nearest.pos[:2] - self.pos[:2]
-            dist = norm(delta)
-            if dist < EPS:
-                return np.zeros(3, dtype=float)
-            cluster_attraction = unit(delta) * self.strength
+        self._target_pos = self._compute_target(evacuees, env)
+
+        delta = self._target_pos - self.pos[:2]
+        dist = norm(delta)
+        if dist < EPS:
+            return np.zeros(3, dtype=float)
+
+        attraction = unit(delta) * self.strength
 
         ramp_repulsion = _compute_ramp_underside_repulsion(self.pos, env.floorplan)
 
         total = np.zeros(3, dtype=float)
-        total[:2] = cluster_attraction + ramp_repulsion[:2]
+        total[:2] = attraction + ramp_repulsion[:2]
         return total
 
     def step(self, env: Environment, cfg: AgentConfig, dt: float) -> None:
@@ -536,11 +582,10 @@ class Harasser(Actor):
         self.pos[0] = clamp(self.pos[0], env.floorplan.bounds_min[0], env.floorplan.bounds_max[0])
         self.pos[1] = clamp(self.pos[1], env.floorplan.bounds_min[1], env.floorplan.bounds_max[1])
 
-        if not is_xy_walkable_on_floor(env.floorplan, 0, self.pos[:2]):
-            self.pos[:2] = nearest_walkable_xy(env.field, 0, self.pos[:2])
-        ground_floor = env.floorplan.floors[0]
-        self.pos[2] = ground_floor.surface_z + self.radius
-        self.floor_index = 0
+        if not is_xy_walkable_on_floor(env.floorplan, self.floor_index, self.pos[:2]):
+            self.pos[:2] = nearest_walkable_xy(env.field, self.floor_index, self.pos[:2])
+        current_floor = env.floorplan.floors[self.floor_index]
+        self.pos[2] = current_floor.surface_z + self.radius
 
         self._bodies[0].pos[:] = self.pos
 
@@ -1153,6 +1198,9 @@ def load_scenario(spec: str, floors: List[Floor]) -> Scenario:
     raw_harassers = data.get("harassers", [])
     harassers: List[HarasserGroup] = []
     for raw in raw_harassers:
+        strategy = raw.get("strategy", "intercept")
+        if strategy not in HARASSER_STRATEGIES:
+            strategy = "intercept"
         harassers.append(
             HarasserGroup(
                 count=int(raw.get("count", 1)),
@@ -1161,6 +1209,7 @@ def load_scenario(spec: str, floors: List[Floor]) -> Scenario:
                 color=raw.get("color", "darkred"),
                 strength=float(raw.get("strength", 5.0)),
                 radius=float(raw.get("radius", 0.3)),
+                strategy=strategy,
             )
         )
 
@@ -1654,6 +1703,7 @@ def create_environment(
                 radius=harasser_group.radius,
                 color=harasser_group.color,
                 strength=harasser_group.strength,
+                strategy=harasser_group.strategy,
             )
             env.add_actor(harasser)
     for spec in scenario.obstacles:
@@ -1980,9 +2030,88 @@ def _compute_dynamic_obstacle_force(evacuee: Evacuee, obstacles: List[Body], cfg
 RAMP_UNDERSIDE_REPULSION_RADIUS = 2.5
 RAMP_UNDERSIDE_REPULSION_STRENGTH = 15.0
 
-
 CLUSTER_DISTANCE_THRESHOLD = 2.0
 CLUSTER_MIN_SIZE = 2
+
+HARASSER_STRATEGIES = ["nearest", "density", "flow", "intercept"]
+
+
+def _compute_density_grid(
+    evacuees: List["Evacuee"],
+    floorplan: Floorplan,
+    cell_size: float = 1.5,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    bounds = floorplan.bounds_min[:2], floorplan.bounds_max[:2]
+    x_min, y_min = bounds[0]
+    x_max, y_max = bounds[1]
+
+    x_coords = np.arange(x_min, x_max + cell_size, cell_size)
+    y_coords = np.arange(y_min, y_max + cell_size, cell_size)
+    density = np.zeros((len(y_coords), len(x_coords)))
+
+    for evacuee in evacuees:
+        if not evacuee.active or evacuee.reached_goal:
+            continue
+        ex, ey = evacuee.pos[0], evacuee.pos[1]
+        ix = int((ex - x_min) / cell_size)
+        iy = int((ey - y_min) / cell_size)
+        if 0 <= ix < len(x_coords) and 0 <= iy < len(y_coords):
+            density[iy, ix] += 1.0
+
+    return density, x_coords, y_coords
+
+
+def _find_highest_density_point(
+    evacuees: List["Evacuee"],
+    floorplan: Floorplan,
+    actor_pos: np.ndarray,
+) -> np.ndarray:
+    density, x_coords, y_coords = _compute_density_grid(evacuees, floorplan)
+
+    if density.max() == 0:
+        return actor_pos[:2].copy()
+
+    iy, ix = np.unravel_index(density.argmax(), density.shape)
+    center_x = x_coords[ix] + (x_coords[1] - x_coords[0]) / 2 if len(x_coords) > 1 else x_coords[0]
+    center_y = y_coords[iy] + (y_coords[1] - y_coords[0]) / 2 if len(y_coords) > 1 else y_coords[0]
+
+    return np.array([center_x, center_y], dtype=float)
+
+
+def _compute_flow_target(
+    evacuees: List["Evacuee"],
+    actor_pos: np.ndarray,
+    floorplan: Floorplan,
+    prediction_time: float = 2.0,
+) -> np.ndarray:
+    if not evacuees:
+        return actor_pos[:2].copy()
+
+    total_pos = np.zeros(2, dtype=float)
+    total_vel = np.zeros(2, dtype=float)
+    total_weight = 0.0
+
+    for evacuee in evacuees:
+        if not evacuee.active or evacuee.reached_goal:
+            continue
+
+        pos = evacuee.pos[:2]
+        vel = evacuee.vel[:2]
+
+        dist_to_goal = min(norm(pos - g.center[:2]) for g in floorplan.goals)
+        weight = 1.0 / max(dist_to_goal, 0.5)
+
+        total_pos += pos * weight
+        total_vel += vel * weight
+        total_weight += weight
+
+    if total_weight > EPS:
+        center = total_pos / total_weight
+        avg_vel = total_vel / total_weight
+        target = center + avg_vel * prediction_time
+        return target
+
+    return actor_pos[:2].copy()
 
 
 def _find_evacuee_clusters(evacuees: List["Evacuee"]) -> List[Tuple[np.ndarray, np.ndarray, int]]:
@@ -2328,30 +2457,8 @@ def render_simulator(
         for actor, harasser in zip(harasser_actors, sim._env.harassers if sim._env else []):
             actor.pos(harasser.pos)
         for target_actor, harasser in zip(target_actors, sim._env.harassers if sim._env else []):
-            evacuees = [a for a in sim._env.actors if isinstance(a, Evacuee) and a.active and not a.reached_goal] if sim._env else []
-            clusters = _find_evacuee_clusters(evacuees) if evacuees else []
-            if clusters:
-                best_cluster = None
-                best_score = -1.0
-                for centroid, velocity, size in clusters:
-                    predicted_pos = centroid + velocity * 2.0
-                    min_dist = INF
-                    for goal in sim.floorplan.goals:
-                        d = norm(predicted_pos - goal.center[:2])
-                        min_dist = min(min_dist, d)
-                    urgency = 1.0 / max(min_dist, 0.5)
-                    score = float(size) * urgency
-                    if score > best_score:
-                        best_score = score
-                        best_cluster = (centroid, velocity)
-                if best_cluster:
-                    centroid, velocity = best_cluster
-                    target_pos = centroid + velocity * 2.0
-                    target_actor.pos([target_pos[0], target_pos[1], harasser.pos[2] + 0.5])
-                else:
-                    target_actor.pos(harasser.pos)
-            else:
-                target_actor.pos(harasser.pos)
+            target_pos = harasser._target_pos
+            target_actor.pos([target_pos[0], target_pos[1], harasser.pos[2] + 0.5])
         status.text(f"step {sim.step_count}/{sim.total_steps}   active: {sim.active_count}   reached: {sim.reached_count}")
         if writer is not None:
             writer.add_frame()
