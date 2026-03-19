@@ -1953,29 +1953,33 @@ def render_simulator(
     if output_video:
         writer = Video(output_video, fps=max(1, int(round(1.0 / sim.dt))))
 
-    while not sim.is_finished:
-        if interrupted:
-            break
+    def on_timer(event):
+        nonlocal interrupted
+        if sim.is_finished or interrupted:
+            plotter.timer_callback("destroy", event.get("timer_event_id"))
+            return
         sim.step()
         for actor, evacuee in zip(sphere_actors, _get_evacuees(sim)):
             actor.pos(evacuee.pos)
             actor.alpha(0.35 if evacuee.reached_goal else 0.95)
         status.text(f"step {sim.step_count}/{sim.total_steps}   active: {sim.active_count}   reached: {sim.reached_count}")
-        plotter.render()
         if writer is not None:
             writer.add_frame()
+        plotter.render()
+
+    timer_dt = max(1, int(round(sim.dt * 1000)))
+    plotter.timer_callback("create", dt=timer_dt)
+    plotter.add_callback("TimerEvent", on_timer)
+    plotter.interactive()
 
     if writer is not None:
         writer.close()
 
     signal.signal(signal.SIGINT, old_handler)
 
-    if not offscreen:
-        if interrupted:
-            print("\nSimulation interrupted.")
-            plotter.close()
-        else:
-            plotter.interactive().close()
+    if interrupted:
+        print("\nSimulation interrupted.")
+    plotter.close()
 
 
 def make_example_data(root: pathlib.Path) -> None:
