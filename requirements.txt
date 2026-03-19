@@ -1,0 +1,5 @@
+vedo
+numpy
+scipy
+matplotlib
+imageio[ffmpeg]
