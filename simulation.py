@@ -235,12 +235,24 @@ class AgentGroup:
 
 
 @dataclass
+@dataclass
+class HarasserGroup:
+    count: int
+    floor: int
+    offset: List[float]
+    color: str
+    strength: float
+    radius: float
+
+
+@dataclass
 class Scenario:
     name: str
     simulation: SimulationConfig
     agent_defaults: AgentConfig
     groups: List[AgentGroup]
     obstacles: List[ScenarioObstacleSpec]
+    harassers: List[HarasserGroup] = field(default_factory=list)
 
 
 @dataclass
@@ -364,6 +376,10 @@ class Environment:
         return [a for a in self._actors if isinstance(a, Evacuee)]
 
     @property
+    def harassers(self) -> List["Harasser"]:
+        return [a for a in self._actors if isinstance(a, Harasser)]
+
+    @property
     def dynamic_obstacles(self) -> List[Body]:
         return self._dynamic_obstacles
 
@@ -451,6 +467,86 @@ class Evacuee(Actor):
         super().reset()
         self.vel[:] = 0.0
         self.ramp_name = None
+
+
+class Harasser(Actor):
+    def __init__(
+        self,
+        pos: Vector,
+        vel: Vector,
+        floor_index: int,
+        radius: float,
+        color: str,
+        strength: float = 5.0,
+    ):
+        super().__init__()
+        self.pos = pos.copy()
+        self.vel = vel
+        self.floor_index = floor_index
+        self.radius = radius
+        self.color = color
+        self.strength = strength
+        self._bodies = [Body(pos=self.pos, radius=radius, owner_id=self.id)]
+
+    @property
+    def x(self) -> float:
+        return float(self.pos[0])
+
+    @property
+    def y(self) -> float:
+        return float(self.pos[1])
+
+    @property
+    def z(self) -> float:
+        return float(self.pos[2])
+
+    def force(self, env: Environment, cfg: AgentConfig) -> Vector:
+        evacuees = [a for a in env.actors if isinstance(a, Evacuee) and a.active and not a.reached_goal]
+        if not evacuees:
+            return np.zeros(3, dtype=float)
+
+        clusters = _find_evacuee_clusters(evacuees)
+        if clusters:
+            cluster_attraction = _compute_cluster_attraction(self.pos, clusters, env.floorplan) * self.strength
+        else:
+            nearest = min(evacuees, key=lambda e: norm(self.pos[:2] - e.pos[:2]))
+            delta = nearest.pos[:2] - self.pos[:2]
+            dist = norm(delta)
+            if dist < EPS:
+                return np.zeros(3, dtype=float)
+            cluster_attraction = unit(delta) * self.strength
+
+        ramp_repulsion = _compute_ramp_underside_repulsion(self.pos, env.floorplan)
+
+        total = np.zeros(3, dtype=float)
+        total[:2] = cluster_attraction + ramp_repulsion[:2]
+        return total
+
+    def step(self, env: Environment, cfg: AgentConfig, dt: float) -> None:
+        if not self.active:
+            return
+
+        force_vec = self.force(env, cfg)
+        self.vel = (1.0 - cfg.damping) * self.vel + cfg.damping * force_vec
+        speed = norm(self.vel)
+        if speed > cfg.max_speed:
+            self.vel *= cfg.max_speed / speed
+
+        self.pos[:2] += self.vel[:2] * dt
+        self.pos[0] = clamp(self.pos[0], env.floorplan.bounds_min[0], env.floorplan.bounds_max[0])
+        self.pos[1] = clamp(self.pos[1], env.floorplan.bounds_min[1], env.floorplan.bounds_max[1])
+
+        if not is_xy_walkable_on_floor(env.floorplan, 0, self.pos[:2]):
+            self.pos[:2] = nearest_walkable_xy(env.field, 0, self.pos[:2])
+        ground_floor = env.floorplan.floors[0]
+        self.pos[2] = ground_floor.surface_z + self.radius
+        self.floor_index = 0
+
+        self._bodies[0].pos[:] = self.pos
+
+    def reset(self) -> None:
+        super().reset()
+        self.vel[:] = 0.0
 
 
 @dataclass
@@ -1053,12 +1149,28 @@ def load_scenario(spec: str, floors: List[Floor]) -> Scenario:
         )
 
     obstacles = [ScenarioObstacleSpec(raw) for raw in data.get("obstacles", [])]
+
+    raw_harassers = data.get("harassers", [])
+    harassers: List[HarasserGroup] = []
+    for raw in raw_harassers:
+        harassers.append(
+            HarasserGroup(
+                count=int(raw.get("count", 1)),
+                floor=int(raw.get("floor", 0)),
+                offset=raw.get("offset", [0.0, 0.0]),
+                color=raw.get("color", "darkred"),
+                strength=float(raw.get("strength", 5.0)),
+                radius=float(raw.get("radius", 0.3)),
+            )
+        )
+
     return Scenario(
         name=data.get("name", pathlib.Path(spec).stem),
         simulation=simulation,
         agent_defaults=defaults,
         groups=groups,
         obstacles=obstacles,
+        harassers=harassers,
     )
 
 
@@ -1358,7 +1470,13 @@ def local_target_xy_for_floor(
     point_xy: Optional[Vector] = None,
 ) -> Vector:
     if floor_index == goal_floor:
-        return floorplan.primary_goal.center[:2].copy()
+        goals_on_floor = [g for g in floorplan.goals if nearest_floor_index(g.center[2], floorplan.floors) == floor_index]
+        if not goals_on_floor:
+            goals_on_floor = [floorplan.primary_goal]
+        if point_xy is not None:
+            nearest = min(goals_on_floor, key=lambda g: norm(point_xy - g.center[:2]))
+            return nearest.center[:2].copy()
+        return goals_on_floor[0].center[:2].copy()
 
     ramps = ramps_toward_goal_for_floor(floorplan, floor_index, goal_floor)
     if not ramps:
@@ -1522,6 +1640,33 @@ def create_environment(
     evacuees = initialize_evacuees(scenario, floorplan, field)
     for evacuee in evacuees:
         env.add_actor(evacuee)
+    for harasser_group in scenario.harassers:
+        floor = floorplan.floors[harasser_group.floor]
+        for _ in range(harasser_group.count):
+            center_x = floor.bbox[0] + harasser_group.offset[0]
+            center_y = floor.bbox[2] + harasser_group.offset[1]
+            center_z = floor.surface_z + harasser_group.radius
+            pos = np.array([center_x, center_y, center_z], dtype=float)
+            harasser = Harasser(
+                pos=pos,
+                vel=np.zeros(3, dtype=float),
+                floor_index=harasser_group.floor,
+                radius=harasser_group.radius,
+                color=harasser_group.color,
+                strength=harasser_group.strength,
+            )
+            env.add_actor(harasser)
+    for spec in scenario.obstacles:
+        raw = spec.raw
+        if raw.get("repulsive", False):
+            floor_idx = raw["floor"]
+            floor = floorplan.floors[floor_idx]
+            center_x = floor.bbox[0] + raw["offset"][0] + raw["size"][0] / 2
+            center_y = floor.bbox[2] + raw["offset"][1] + raw["size"][1] / 2
+            center_z = floor.surface_z + raw["height"] / 2
+            radius = max(raw["size"][0], raw["size"][1]) / 2
+            body = Body(pos=np.array([center_x, center_y, center_z]), radius=radius, owner_id=0)
+            env.add_dynamic_obstacle(body)
     return env
 
 
@@ -1589,17 +1734,28 @@ def compute_ramp_edge_force(agent, floorplan: Floorplan, cfg: AgentConfig) -> Ve
 
 def _compute_navigation_force_for_evacuee(
     evacuee: Evacuee,
+    actors: List[Actor],
+    dynamic_obstacles: List[Body],
     floorplan: Floorplan,
     field: NavigationField,
     cfg: AgentConfig,
 ) -> Vector:
     evacuee_xy = evacuee.pos[:2]
+    force_xy = np.zeros(2, dtype=float)
+
+    for goal in floorplan.goals:
+        goal_xy = goal.center[:2]
+        delta = goal_xy - evacuee_xy
+        dist = norm(delta)
+        if dist > EPS:
+            attraction = cfg.goal_gain / max(dist * dist, 0.5)
+            force_xy += unit(delta) * attraction
 
     active_ramp = get_ramp_by_name(floorplan, evacuee.ramp_name)
     if active_ramp is not None:
         travel = get_ramp_travel_for_goal(active_ramp, field.goal_floor)
         if travel is None:
-            return np.zeros(3, dtype=float)
+            return np.array([force_xy[0], force_xy[1], 0.0], dtype=float)
         entry_floor, entry_xy, exit_floor, exit_xy, travel_tangent = travel
         centerline_xy, along, lateral, tangent, normal, length = ramp_local_coordinates(
             active_ramp,
@@ -1615,7 +1771,7 @@ def _compute_navigation_force_for_evacuee(
         half_width = max(0.5 * active_ramp.width, EPS)
         lateral_ratio = clamp(abs(lateral) / half_width, 0.0, 1.0)
 
-        force_xy = 1.35 * cfg.ramp_gain * travel_tangent
+        force_xy += 1.35 * cfg.ramp_gain * travel_tangent
         force_xy += 0.9 * cfg.ramp_gain * lateral_ratio * unit(center_correction)
         force_xy += (0.55 + 0.35 * progress) * cfg.ramp_gain * unit(exit_target)
 
@@ -1631,18 +1787,16 @@ def _compute_navigation_force_for_evacuee(
         return np.array([force_xy[0], force_xy[1], 0.0], dtype=float)
 
     target_xy = local_target_xy_for_floor(floorplan, evacuee.floor_index, field.goal_floor, evacuee_xy)
-    force_xy = cfg.nav_gain * unit(target_xy - evacuee_xy)
-    if evacuee.floor_index == field.goal_floor:
-        goal_pull = unit(floorplan.primary_goal.center[:2] - evacuee_xy)
-        force_xy += cfg.goal_gain * goal_pull
+    force_xy += cfg.nav_gain * unit(target_xy - evacuee_xy)
 
-    ramp = choose_guiding_ramp(evacuee, floorplan, field.goal_floor)
+    ramp = _choose_ramp_by_attractiveness(
+        evacuee, actors, dynamic_obstacles, floorplan, field.goal_floor, cfg
+    )
     if ramp is not None:
         travel = get_ramp_travel_for_goal(ramp, field.goal_floor)
         assert travel is not None
         entry_floor, entry_xy, exit_floor, exit_xy, travel_tangent = travel
         if evacuee.floor_index == entry_floor:
-            to_portal = exit_xy - entry_xy
             dist_to_polygon = 0.0 if point_in_polygon(evacuee_xy, ramp.polygon) else norm(evacuee_xy - entry_xy)
             entry_target = entry_xy - evacuee_xy
             if can_enter_ramp_from_floor(ramp, field.goal_floor, evacuee.floor_index, evacuee_xy):
@@ -1654,10 +1808,69 @@ def _compute_navigation_force_for_evacuee(
                 align = unit(centerline_at - evacuee_xy)
                 force_xy += 1.15 * cfg.ramp_gain * unit(entry_target)
                 force_xy += 0.35 * cfg.ramp_gain * align
-            elif norm(to_portal) > EPS:
-                force_xy += 0.45 * cfg.ramp_gain * unit(entry_xy - evacuee_xy)
+            elif norm(entry_target) > EPS:
+                force_xy += 0.45 * cfg.ramp_gain * unit(entry_target)
 
     return np.array([force_xy[0], force_xy[1], 0.0], dtype=float)
+
+
+def _calculate_repulsion_at_point(
+    point_xy: np.ndarray,
+    actors: List[Actor],
+    dynamic_obstacles: List[Body],
+    cfg: AgentConfig,
+) -> float:
+    total_repulsion = 0.0
+    for actor in actors:
+        if not isinstance(actor, Evacuee):
+            continue
+        if not actor.active or actor.reached_goal:
+            continue
+        delta = point_xy - actor.pos[:2]
+        dist = norm(delta)
+        if dist > EPS and dist < cfg.social_range:
+            total_repulsion += cfg.social_strength * (1.0 / max(dist, 0.1))
+    for obs in dynamic_obstacles:
+        delta = point_xy - obs.pos[:2]
+        dist = norm(delta)
+        if dist > EPS and dist < cfg.wall_range:
+            total_repulsion += cfg.wall_strength * (1.0 / max(dist, 0.1))
+    return total_repulsion
+
+
+def _choose_ramp_by_attractiveness(
+    evacuee: Evacuee,
+    actors: List[Actor],
+    dynamic_obstacles: List[Body],
+    floorplan: Floorplan,
+    goal_floor: int,
+    cfg: AgentConfig,
+) -> Optional[Ramp]:
+    best_ramp = None
+    best_attractiveness = -INF
+    evacuee_xy = evacuee.pos[:2]
+
+    for ramp in ramps_toward_goal_for_floor(floorplan, evacuee.floor_index, goal_floor):
+        travel = get_ramp_travel_for_goal(ramp, goal_floor)
+        if travel is None:
+            continue
+        _, entry_xy, _, _, _ = travel
+
+        dist_to_ramp = norm(evacuee_xy - entry_xy)
+        if dist_to_ramp < EPS:
+            dist_to_ramp = EPS
+
+        base_attraction = cfg.ramp_gain / max(dist_to_ramp, 0.5)
+
+        repulsion_at_entry = _calculate_repulsion_at_point(entry_xy, actors, dynamic_obstacles, cfg)
+
+        attractiveness = base_attraction - repulsion_at_entry
+
+        if attractiveness > best_attractiveness:
+            best_attractiveness = attractiveness
+            best_ramp = ramp
+
+    return best_ramp
 
 
 def compute_evacuee_force(
@@ -1672,7 +1885,9 @@ def compute_evacuee_force(
         return np.zeros(3, dtype=float)
 
     force = np.zeros(3, dtype=float)
-    navigation_force = _compute_navigation_force_for_evacuee(evacuee, floorplan, field, cfg)
+    navigation_force = _compute_navigation_force_for_evacuee(
+        evacuee, actors, dynamic_obstacles, floorplan, field, cfg
+    )
     wall_force = compute_wall_force(evacuee, field, cfg)
     ramp_edge_force = compute_ramp_edge_force(evacuee, floorplan, cfg)
 
@@ -1710,21 +1925,35 @@ def _compute_social_force_for_evacuee(
 ) -> Vector:
     total = np.zeros(3, dtype=float)
     for actor in actors:
-        if not isinstance(actor, Evacuee):
+        if actor is evacuee:
             continue
-        if actor is evacuee or not actor.active or actor.reached_goal:
-            continue
-        delta = evacuee.pos - actor.pos
-        distance = norm(delta)
-        if distance < EPS or distance > max(cfg.social_range, actor.repulsion.range):
-            continue
-        weight = anisotropic_weight(actor.vel, evacuee.pos - actor.pos, actor.repulsion)
-        effective_range = max(0.25, actor.repulsion.range)
-        if distance >= effective_range:
-            continue
-        direction = unit(delta)
-        strength = cfg.social_strength * actor.repulsion.strength * weight
-        total += direction * strength * ((1.0 / max(distance, 0.1)) - (1.0 / effective_range)) / max(distance, 0.15)
+        if isinstance(actor, Evacuee):
+            if not actor.active or actor.reached_goal:
+                continue
+            delta = evacuee.pos - actor.pos
+            distance = norm(delta)
+            if distance < EPS or distance > max(cfg.social_range, actor.repulsion.range):
+                continue
+            weight = anisotropic_weight(actor.vel, evacuee.pos - actor.pos, actor.repulsion)
+            effective_range = max(0.25, actor.repulsion.range)
+            if distance >= effective_range:
+                continue
+            direction = unit(delta)
+            strength = cfg.social_strength * actor.repulsion.strength * weight
+            total += direction * strength * ((1.0 / max(distance, 0.1)) - (1.0 / effective_range)) / max(distance, 0.15)
+        elif isinstance(actor, Harasser):
+            if not actor.active:
+                continue
+            delta = evacuee.pos - actor.pos
+            distance = norm(delta)
+            effective_range = cfg.social_range * 2.0
+            if distance < EPS or distance > effective_range:
+                continue
+            if distance >= effective_range:
+                continue
+            direction = unit(delta)
+            strength = cfg.social_strength * 15.0
+            total += direction * strength * ((1.0 / max(distance, 0.1)) - (1.0 / effective_range)) / max(distance, 0.15)
 
     if any(distance_point_to_aabb(evacuee.pos, g.min_corner, g.max_corner) <= 2.0 * evacuee.radius for g in floorplan.goals):
         total *= 0.1
@@ -1745,6 +1974,125 @@ def _compute_dynamic_obstacle_force(evacuee: Evacuee, obstacles: List[Body], cfg
         strength = cfg.social_strength * 1.5
         clearance = max(distance - combined_radius, 0.1)
         total += direction * strength * (1.0 / clearance)
+    return total
+
+
+RAMP_UNDERSIDE_REPULSION_RADIUS = 2.5
+RAMP_UNDERSIDE_REPULSION_STRENGTH = 15.0
+
+
+CLUSTER_DISTANCE_THRESHOLD = 2.0
+CLUSTER_MIN_SIZE = 2
+
+
+def _find_evacuee_clusters(evacuees: List["Evacuee"]) -> List[Tuple[np.ndarray, np.ndarray, int]]:
+    if len(evacuees) < CLUSTER_MIN_SIZE:
+        return []
+
+    positions = np.array([e.pos[:2] for e in evacuees])
+    visited = set()
+    clusters = []
+
+    for i in range(len(evacuees)):
+        if i in visited:
+            continue
+
+        cluster_indices = [i]
+        visited.add(i)
+        queue = [i]
+
+        while queue:
+            current = queue.pop(0)
+            for j in range(len(evacuees)):
+                if j in visited:
+                    continue
+                dist = norm(positions[current] - positions[j])
+                if dist < CLUSTER_DISTANCE_THRESHOLD:
+                    visited.add(j)
+                    queue.append(j)
+                    cluster_indices.append(j)
+
+        if len(cluster_indices) >= CLUSTER_MIN_SIZE:
+            cluster_positions = positions[cluster_indices]
+            centroid = np.mean(cluster_positions, axis=0)
+            velocities = np.array([evacuees[idx].vel[:2] for idx in cluster_indices])
+            avg_velocity = np.mean(velocities, axis=0) if len(velocities) > 0 else np.zeros(2)
+            clusters.append((centroid, avg_velocity, len(cluster_indices)))
+
+    return clusters
+
+
+def _compute_cluster_attraction(
+    actor_pos: np.ndarray,
+    clusters: List[Tuple[np.ndarray, np.ndarray, int]],
+    floorplan: Floorplan,
+    prediction_time: float = 2.0,
+) -> np.ndarray:
+    if not clusters:
+        return np.zeros(2, dtype=float)
+
+    target = np.zeros(2, dtype=float)
+    total_weight = 0.0
+
+    for centroid, velocity, size in clusters:
+        predicted_pos = centroid + velocity * prediction_time
+
+        min_dist_to_goal = INF
+        for goal in floorplan.goals:
+            dist = norm(predicted_pos - goal.center[:2])
+            min_dist_to_goal = min(min_dist_to_goal, dist)
+
+        urgency = 1.0 / max(min_dist_to_goal, 0.5)
+
+        delta = predicted_pos - actor_pos[:2]
+        dist = norm(delta)
+        if dist < EPS:
+            continue
+
+        weight = float(size) * urgency
+        target += unit(delta) * weight
+        total_weight += weight
+
+    if total_weight > EPS:
+        return target / total_weight
+    return np.zeros(2, dtype=float)
+
+
+def _compute_ramp_underside_repulsion(
+    actor_pos: np.ndarray,
+    floorplan: Floorplan,
+) -> Vector:
+    total = np.zeros(3, dtype=float)
+    actor_xy = actor_pos[:2]
+
+    for ramp in floorplan.ramps:
+        start_xy = ramp.start[:2]
+        end_xy = ramp.end[:2]
+
+        closest_point, _ = closest_point_on_segment_2d(actor_xy, start_xy, end_xy)
+        delta = actor_xy - closest_point
+        dist = norm(delta)
+
+        if dist > RAMP_UNDERSIDE_REPULSION_RADIUS or dist < EPS:
+            continue
+
+        tangent = unit(end_xy - start_xy)
+        perp = np.array([-tangent[1], tangent[0]], dtype=float)
+
+        to_actor = unit(delta)
+        perp_alignment = abs(float(np.dot(to_actor, perp)))
+
+        if perp_alignment < 0.2:
+            continue
+
+        perp_sign = 1.0 if float(np.dot(to_actor, perp)) > 0 else -1.0
+
+        strength = RAMP_UNDERSIDE_REPULSION_STRENGTH * (1.0 - dist / RAMP_UNDERSIDE_REPULSION_RADIUS)
+
+        slide_dir = perp * perp_sign
+
+        total[:2] += slide_dir * strength
+
     return total
 
 
@@ -1946,6 +2294,21 @@ def render_simulator(
     if sphere_actors:
         plotter.add(*sphere_actors)
 
+    harassers = sim._env.harassers if sim._env else []
+    harasser_actors = []
+    target_actors = []
+    for harasser in harassers:
+        actor = Sphere(pos=harasser.pos, r=harasser.radius, c=harasser.color)
+        actor.alpha(0.95)
+        harasser_actors.append(actor)
+        target = Sphere(pos=harasser.pos, r=0.3, c="red")
+        target.alpha(0.5)
+        target_actors.append(target)
+    if harasser_actors:
+        plotter.add(*harasser_actors)
+    if target_actors:
+        plotter.add(*target_actors)
+
     status = Text2D("", pos="top-left", c="white", font="Courier", s=0.8)
     plotter.add(status)
 
@@ -1962,12 +2325,39 @@ def render_simulator(
         for actor, evacuee in zip(sphere_actors, _get_evacuees(sim)):
             actor.pos(evacuee.pos)
             actor.alpha(0.35 if evacuee.reached_goal else 0.95)
+        for actor, harasser in zip(harasser_actors, sim._env.harassers if sim._env else []):
+            actor.pos(harasser.pos)
+        for target_actor, harasser in zip(target_actors, sim._env.harassers if sim._env else []):
+            evacuees = [a for a in sim._env.actors if isinstance(a, Evacuee) and a.active and not a.reached_goal] if sim._env else []
+            clusters = _find_evacuee_clusters(evacuees) if evacuees else []
+            if clusters:
+                best_cluster = None
+                best_score = -1.0
+                for centroid, velocity, size in clusters:
+                    predicted_pos = centroid + velocity * 2.0
+                    min_dist = INF
+                    for goal in sim.floorplan.goals:
+                        d = norm(predicted_pos - goal.center[:2])
+                        min_dist = min(min_dist, d)
+                    urgency = 1.0 / max(min_dist, 0.5)
+                    score = float(size) * urgency
+                    if score > best_score:
+                        best_score = score
+                        best_cluster = (centroid, velocity)
+                if best_cluster:
+                    centroid, velocity = best_cluster
+                    target_pos = centroid + velocity * 2.0
+                    target_actor.pos([target_pos[0], target_pos[1], harasser.pos[2] + 0.5])
+                else:
+                    target_actor.pos(harasser.pos)
+            else:
+                target_actor.pos(harasser.pos)
         status.text(f"step {sim.step_count}/{sim.total_steps}   active: {sim.active_count}   reached: {sim.reached_count}")
         if writer is not None:
             writer.add_frame()
         plotter.render()
 
-    timer_dt = max(1, int(round(sim.dt * 1000)))
+    timer_dt = max(16, int(round(sim.dt * 1000)))
     plotter.timer_callback("create", dt=timer_dt)
     plotter.add_callback("TimerEvent", on_timer)
     plotter.interactive()
