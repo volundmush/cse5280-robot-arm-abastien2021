@@ -92,6 +92,7 @@ import math
 import os
 import pathlib
 import random
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -273,16 +274,183 @@ class Floorplan:
 
 
 @dataclass
-class Agent:
+class Body:
     pos: Vector
-    vel: Vector
-    floor_index: int
     radius: float
-    color: str
-    repulsion: RepulsionConfig
-    active: bool = True
-    reached_goal: bool = False
-    ramp_name: Optional[str] = None
+    owner_id: int
+
+    @property
+    def x(self) -> float:
+        return float(self.pos[0])
+
+    @property
+    def y(self) -> float:
+        return float(self.pos[1])
+
+    @property
+    def z(self) -> float:
+        return float(self.pos[2])
+
+
+class Actor(ABC):
+    _next_id: int = 0
+
+    def __init__(self):
+        self.id = Actor._next_id
+        Actor._next_id += 1
+        self._bodies: List[Body] = []
+        self.active: bool = True
+        self._reached_goal: bool = False
+
+    @property
+    def bodies(self) -> List[Body]:
+        return self._bodies
+
+    @property
+    def reached_goal(self) -> bool:
+        return self._reached_goal
+
+    @reached_goal.setter
+    def reached_goal(self, value: bool) -> None:
+        self._reached_goal = value
+
+    @abstractmethod
+    def step(
+        self,
+        env: "Environment",
+        cfg: AgentConfig,
+        dt: float,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def force(
+        self,
+        env: "Environment",
+        cfg: AgentConfig,
+    ) -> Vector:
+        pass
+
+    def reset(self) -> None:
+        self.active = True
+        self._reached_goal = False
+        for body in self._bodies:
+            body.pos[2] = body.pos[2]  # placeholder for subclass reset
+
+
+class Environment:
+    def __init__(
+        self,
+        floorplan: Floorplan,
+        field: NavigationField,
+    ):
+        self.floorplan = floorplan
+        self.field = field
+        self._actors: List[Actor] = []
+        self._dynamic_obstacles: List[Body] = []
+
+    def add_actor(self, actor: Actor) -> None:
+        self._actors.append(actor)
+
+    def add_dynamic_obstacle(self, body: Body) -> None:
+        self._dynamic_obstacles.append(body)
+
+    @property
+    def actors(self) -> List[Actor]:
+        return self._actors
+
+    @property
+    def evacuees(self) -> List["Evacuee"]:
+        return [a for a in self._actors if isinstance(a, Evacuee)]
+
+    @property
+    def dynamic_obstacles(self) -> List[Body]:
+        return self._dynamic_obstacles
+
+    def all_bodies(self) -> List[Body]:
+        bodies: List[Body] = []
+        for actor in self._actors:
+            bodies.extend(actor.bodies)
+        bodies.extend(self._dynamic_obstacles)
+        return bodies
+
+    def bodies_of_type(self, actor_type: type) -> List[Body]:
+        return [b for a in self._actors if isinstance(a, actor_type) for b in a.bodies]
+
+
+class Evacuee(Actor):
+    def __init__(
+        self,
+        pos: Vector,
+        vel: Vector,
+        floor_index: int,
+        radius: float,
+        color: str,
+        repulsion: RepulsionConfig,
+    ):
+        super().__init__()
+        self.pos = pos
+        self.vel = vel
+        self.floor_index = floor_index
+        self.radius = radius
+        self.color = color
+        self.repulsion = repulsion
+        self.ramp_name: Optional[str] = None
+        self._bodies = [Body(pos=self.pos, radius=radius, owner_id=self.id)]
+
+    @property
+    def x(self) -> float:
+        return float(self.pos[0])
+
+    @property
+    def y(self) -> float:
+        return float(self.pos[1])
+
+    @property
+    def z(self) -> float:
+        return float(self.pos[2])
+
+    def force(self, env: Environment, cfg: AgentConfig) -> Vector:
+        return compute_evacuee_force(
+            self,
+            env.actors,
+            env.floorplan,
+            env.field,
+            env.dynamic_obstacles,
+            cfg,
+        )
+
+    def step(self, env: Environment, cfg: AgentConfig, dt: float) -> None:
+        if not self.active:
+            return
+
+        force_vec = self.force(env, cfg)
+        self.vel = (1.0 - cfg.damping) * self.vel + cfg.damping * force_vec
+        speed = norm(self.vel)
+        if speed > cfg.max_speed:
+            self.vel *= cfg.max_speed / speed
+
+        self.pos[:2] += self.vel[:2] * dt
+        self.pos[0] = clamp(self.pos[0], env.floorplan.bounds_min[0], env.floorplan.bounds_max[0])
+        self.pos[1] = clamp(self.pos[1], env.floorplan.bounds_min[1], env.floorplan.bounds_max[1])
+
+        _project_evacuee_to_walkable(self, env.floorplan, env.field)
+        _update_evacuee_surface(self, env.floorplan, env.field)
+
+        for goal in env.floorplan.goals:
+            if distance_point_to_aabb(self.pos, goal.min_corner, goal.max_corner) <= self.radius:
+                self.reached_goal = True
+                self.active = False
+                self.vel[:] = 0.0
+                goal_center = goal.center.copy()
+                goal_center[2] = max(goal_center[2], goal.min_corner[2] + self.radius)
+                self.pos[:] = goal_center
+                break
+
+    def reset(self) -> None:
+        super().reset()
+        self.vel[:] = 0.0
+        self.ramp_name = None
 
 
 @dataclass
@@ -294,6 +462,79 @@ class NavigationField:
     distance_to_block: np.ndarray
     goal_floor: int
     floor_lookup: Dict[int, Floor]
+
+
+class Simulator:
+    def __init__(
+        self,
+        floorplan: Floorplan,
+        scenario: Scenario,
+        env: Environment,
+        field: Optional[NavigationField] = None,
+    ):
+        self.floorplan = floorplan
+        self.scenario = scenario
+        self._env = env
+        self._field = field
+        self.step_count = 0
+        self._interrupted = False
+
+    @property
+    def env(self) -> Environment:
+        return self._env
+
+    @env.setter
+    def env(self, value: Environment) -> None:
+        self._env = value
+
+    @property
+    def field(self) -> Optional[NavigationField]:
+        return self._field
+
+    @field.setter
+    def field(self, value: NavigationField) -> None:
+        self._field = value
+
+    @property
+    def dt(self) -> float:
+        return self.scenario.simulation.dt
+
+    @property
+    def total_steps(self) -> int:
+        return self.scenario.simulation.steps
+
+    @property
+    def active_count(self) -> int:
+        return sum(1 for a in self._env.actors if a.active)
+
+    @property
+    def reached_count(self) -> int:
+        return sum(1 for a in self._env.actors if a.reached_goal)
+
+    @property
+    def is_finished(self) -> bool:
+        return self.step_count >= self.total_steps
+
+    def step(self) -> None:
+        if self._interrupted or self.is_finished:
+            return
+
+        for actor in self._env.actors:
+            actor.step(self._env, self.scenario.agent_defaults, self.dt)
+        self.step_count += 1
+
+    def run(self) -> None:
+        while not self._interrupted and not self.is_finished:
+            self.step()
+
+    def interrupt(self) -> None:
+        self._interrupted = True
+
+    def reset(self) -> None:
+        self.step_count = 0
+        self._interrupted = False
+        for actor in self._env.actors:
+            actor.reset()
 
 
 def vec(values: Sequence[float]) -> Vector:
@@ -1246,8 +1487,8 @@ def resolve_spawn_position(field: NavigationField, floorplan: Floorplan, floor_i
     return np.array([snapped_xy[0], snapped_xy[1], z_value + radius], dtype=float), floor_index, None if ramp is None else ramp.name
 
 
-def initialize_agents(scenario: Scenario, floorplan: Floorplan, field: NavigationField) -> List[Agent]:
-    agents: List[Agent] = []
+def initialize_evacuees(scenario: Scenario, floorplan: Floorplan, field: NavigationField) -> List[Evacuee]:
+    evacuees: List[Evacuee] = []
     for group in scenario.groups:
         floor = floorplan.floors[group.floor]
         for _ in range(group.count):
@@ -1259,18 +1500,29 @@ def initialize_agents(scenario: Scenario, floorplan: Floorplan, field: Navigatio
                 point_xy,
                 scenario.agent_defaults.radius,
             )
-            agents.append(
-                Agent(
-                    pos=position,
-                    vel=np.zeros(3, dtype=float),
-                    floor_index=floor_index,
-                    radius=scenario.agent_defaults.radius,
-                    color=group.color,
-                    repulsion=group.repulsion,
-                    ramp_name=ramp_name,
-                )
+            evacuee = Evacuee(
+                pos=position,
+                vel=np.zeros(3, dtype=float),
+                floor_index=floor_index,
+                radius=scenario.agent_defaults.radius,
+                color=group.color,
+                repulsion=group.repulsion,
             )
-    return agents
+            evacuee.ramp_name = ramp_name
+            evacuees.append(evacuee)
+    return evacuees
+
+
+def create_environment(
+    scenario: Scenario,
+    floorplan: Floorplan,
+    field: NavigationField,
+) -> Environment:
+    env = Environment(floorplan=floorplan, field=field)
+    evacuees = initialize_evacuees(scenario, floorplan, field)
+    for evacuee in evacuees:
+        env.add_actor(evacuee)
+    return env
 
 
 def anisotropic_weight(forward_dir: Vector, direction_to_other: Vector, cfg: RepulsionConfig) -> float:
@@ -1284,7 +1536,7 @@ def anisotropic_weight(forward_dir: Vector, direction_to_other: Vector, cfg: Rep
     return cfg.forward_strength if angle <= cfg.forward_angle_deg else cfg.backward_strength
 
 
-def choose_guiding_ramp(agent: Agent, floorplan: Floorplan, goal_floor: int) -> Optional[Ramp]:
+def choose_guiding_ramp(agent, floorplan: Floorplan, goal_floor: int) -> Optional[Ramp]:
     best_ramp = None
     best_value = INF
     agent_xy = agent.pos[:2]
@@ -1299,74 +1551,7 @@ def choose_guiding_ramp(agent: Agent, floorplan: Floorplan, goal_floor: int) -> 
     return best_ramp
 
 
-def compute_navigation_force(agent: Agent, floorplan: Floorplan, field: NavigationField, cfg: AgentConfig) -> Vector:
-    agent_xy = agent.pos[:2]
-
-    active_ramp = get_ramp_by_name(floorplan, agent.ramp_name)
-    if active_ramp is not None:
-        travel = get_ramp_travel_for_goal(active_ramp, field.goal_floor)
-        if travel is None:
-            return np.zeros(3, dtype=float)
-        entry_floor, entry_xy, exit_floor, exit_xy, travel_tangent = travel
-        centerline_xy, along, lateral, tangent, normal, length = ramp_local_coordinates(
-            active_ramp,
-            agent_xy,
-        )
-
-        center_correction = centerline_xy - agent_xy
-        exit_target = exit_xy - agent_xy
-        if entry_floor == active_ramp.from_floor:
-            progress = clamp(along / max(length, EPS), 0.0, 1.0)
-        else:
-            progress = clamp((length - along) / max(length, EPS), 0.0, 1.0)
-        half_width = max(0.5 * active_ramp.width, EPS)
-        lateral_ratio = clamp(abs(lateral) / half_width, 0.0, 1.0)
-
-        force_xy = 1.35 * cfg.ramp_gain * travel_tangent
-        force_xy += 0.9 * cfg.ramp_gain * lateral_ratio * unit(center_correction)
-        force_xy += (0.55 + 0.35 * progress) * cfg.ramp_gain * unit(exit_target)
-
-        if norm(exit_target) < max(0.8, 0.6 * active_ramp.width):
-            next_target = local_target_xy_for_floor(
-                floorplan,
-                exit_floor,
-                field.goal_floor,
-                exit_xy,
-            )
-            force_xy += 0.4 * cfg.nav_gain * unit(next_target - agent_xy)
-
-        return np.array([force_xy[0], force_xy[1], 0.0], dtype=float)
-
-    target_xy = local_target_xy_for_floor(floorplan, agent.floor_index, field.goal_floor, agent_xy)
-    force_xy = cfg.nav_gain * unit(target_xy - agent_xy)
-    if agent.floor_index == field.goal_floor:
-        goal_pull = unit(floorplan.primary_goal.center[:2] - agent_xy)
-        force_xy += cfg.goal_gain * goal_pull
-
-    ramp = choose_guiding_ramp(agent, floorplan, field.goal_floor)
-    if ramp is not None:
-        travel = get_ramp_travel_for_goal(ramp, field.goal_floor)
-        assert travel is not None
-        entry_floor, entry_xy, exit_floor, exit_xy, travel_tangent = travel
-        if agent.floor_index == entry_floor:
-            to_portal = exit_xy - entry_xy
-            dist_to_polygon = 0.0 if point_in_polygon(agent_xy, ramp.polygon) else norm(agent_xy - entry_xy)
-            entry_target = entry_xy - agent_xy
-            if can_enter_ramp_from_floor(ramp, field.goal_floor, agent.floor_index, agent_xy):
-                centerline_at, _ = closest_point_on_segment_2d(agent_xy, ramp.start[:2], ramp.end[:2])
-                align = unit(centerline_at - agent_xy)
-                force_xy += cfg.ramp_gain * travel_tangent + 0.6 * cfg.ramp_gain * align
-            elif dist_to_polygon < max(2.0 * ramp.width, 2.5):
-                centerline_at, _ = closest_point_on_segment_2d(agent_xy, ramp.start[:2], ramp.end[:2])
-                align = unit(centerline_at - agent_xy)
-                force_xy += 1.15 * cfg.ramp_gain * unit(entry_target)
-                force_xy += 0.35 * cfg.ramp_gain * align
-            elif norm(to_portal) > EPS:
-                force_xy += 0.45 * cfg.ramp_gain * unit(entry_xy - agent_xy)
-    return np.array([force_xy[0], force_xy[1], 0.0], dtype=float)
-
-
-def compute_wall_force(agent: Agent, field: NavigationField, cfg: AgentConfig) -> Vector:
+def compute_wall_force(agent, field: NavigationField, cfg: AgentConfig) -> Vector:
     dist_grid = field.distance_to_block[agent.floor_index]
     d = sample_scalar(dist_grid, field.x_coords, field.y_coords, agent.pos[:2])
     effective_range = min(cfg.wall_range, max(0.45, 2.4 * agent.radius + 0.12))
@@ -1379,7 +1564,7 @@ def compute_wall_force(agent: Agent, field: NavigationField, cfg: AgentConfig) -
     return np.array([direction[0], direction[1], 0.0], dtype=float) * magnitude
 
 
-def compute_ramp_edge_force(agent: Agent, floorplan: Floorplan, cfg: AgentConfig) -> Vector:
+def compute_ramp_edge_force(agent, floorplan: Floorplan, cfg: AgentConfig) -> Vector:
     ramp = get_ramp_by_name(floorplan, agent.ramp_name)
     if ramp is None:
         return np.zeros(3, dtype=float)
@@ -1402,36 +1587,94 @@ def compute_ramp_edge_force(agent: Agent, floorplan: Floorplan, cfg: AgentConfig
     return np.array([direction[0], direction[1], 0.0], dtype=float) * magnitude
 
 
-def compute_social_force(index: int, agents: Sequence[Agent], floorplan: Floorplan, cfg: AgentConfig) -> Vector:
-    agent = agents[index]
-    total = np.zeros(3, dtype=float)
-    for j, other in enumerate(agents):
-        if j == index or not other.active or other.reached_goal:
-            continue
-        delta = agent.pos - other.pos
-        distance = norm(delta)
-        if distance < EPS or distance > max(cfg.social_range, other.repulsion.range):
-            continue
-        weight = anisotropic_weight(other.vel, agent.pos - other.pos, other.repulsion)
-        effective_range = max(0.25, other.repulsion.range)
-        if distance >= effective_range:
-            continue
-        direction = unit(delta)
-        strength = cfg.social_strength * other.repulsion.strength * weight
-        total += direction * strength * ((1.0 / max(distance, 0.1)) - (1.0 / effective_range)) / max(distance, 0.15)
-    if any(distance_point_to_aabb(agent.pos, g.min_corner, g.max_corner) <= 2.0 * agent.radius for g in floorplan.goals):
-        total *= 0.1
-    return total
+def _compute_navigation_force_for_evacuee(
+    evacuee: Evacuee,
+    floorplan: Floorplan,
+    field: NavigationField,
+    cfg: AgentConfig,
+) -> Vector:
+    evacuee_xy = evacuee.pos[:2]
+
+    active_ramp = get_ramp_by_name(floorplan, evacuee.ramp_name)
+    if active_ramp is not None:
+        travel = get_ramp_travel_for_goal(active_ramp, field.goal_floor)
+        if travel is None:
+            return np.zeros(3, dtype=float)
+        entry_floor, entry_xy, exit_floor, exit_xy, travel_tangent = travel
+        centerline_xy, along, lateral, tangent, normal, length = ramp_local_coordinates(
+            active_ramp,
+            evacuee_xy,
+        )
+
+        center_correction = centerline_xy - evacuee_xy
+        exit_target = exit_xy - evacuee_xy
+        if entry_floor == active_ramp.from_floor:
+            progress = clamp(along / max(length, EPS), 0.0, 1.0)
+        else:
+            progress = clamp((length - along) / max(length, EPS), 0.0, 1.0)
+        half_width = max(0.5 * active_ramp.width, EPS)
+        lateral_ratio = clamp(abs(lateral) / half_width, 0.0, 1.0)
+
+        force_xy = 1.35 * cfg.ramp_gain * travel_tangent
+        force_xy += 0.9 * cfg.ramp_gain * lateral_ratio * unit(center_correction)
+        force_xy += (0.55 + 0.35 * progress) * cfg.ramp_gain * unit(exit_target)
+
+        if norm(exit_target) < max(0.8, 0.6 * active_ramp.width):
+            next_target = local_target_xy_for_floor(
+                floorplan,
+                exit_floor,
+                field.goal_floor,
+                exit_xy,
+            )
+            force_xy += 0.4 * cfg.nav_gain * unit(next_target - evacuee_xy)
+
+        return np.array([force_xy[0], force_xy[1], 0.0], dtype=float)
+
+    target_xy = local_target_xy_for_floor(floorplan, evacuee.floor_index, field.goal_floor, evacuee_xy)
+    force_xy = cfg.nav_gain * unit(target_xy - evacuee_xy)
+    if evacuee.floor_index == field.goal_floor:
+        goal_pull = unit(floorplan.primary_goal.center[:2] - evacuee_xy)
+        force_xy += cfg.goal_gain * goal_pull
+
+    ramp = choose_guiding_ramp(evacuee, floorplan, field.goal_floor)
+    if ramp is not None:
+        travel = get_ramp_travel_for_goal(ramp, field.goal_floor)
+        assert travel is not None
+        entry_floor, entry_xy, exit_floor, exit_xy, travel_tangent = travel
+        if evacuee.floor_index == entry_floor:
+            to_portal = exit_xy - entry_xy
+            dist_to_polygon = 0.0 if point_in_polygon(evacuee_xy, ramp.polygon) else norm(evacuee_xy - entry_xy)
+            entry_target = entry_xy - evacuee_xy
+            if can_enter_ramp_from_floor(ramp, field.goal_floor, evacuee.floor_index, evacuee_xy):
+                centerline_at, _ = closest_point_on_segment_2d(evacuee_xy, ramp.start[:2], ramp.end[:2])
+                align = unit(centerline_at - evacuee_xy)
+                force_xy += cfg.ramp_gain * travel_tangent + 0.6 * cfg.ramp_gain * align
+            elif dist_to_polygon < max(2.0 * ramp.width, 2.5):
+                centerline_at, _ = closest_point_on_segment_2d(evacuee_xy, ramp.start[:2], ramp.end[:2])
+                align = unit(centerline_at - evacuee_xy)
+                force_xy += 1.15 * cfg.ramp_gain * unit(entry_target)
+                force_xy += 0.35 * cfg.ramp_gain * align
+            elif norm(to_portal) > EPS:
+                force_xy += 0.45 * cfg.ramp_gain * unit(entry_xy - evacuee_xy)
+
+    return np.array([force_xy[0], force_xy[1], 0.0], dtype=float)
 
 
-def compute_agent_force(index: int, agents: Sequence[Agent], floorplan: Floorplan, field: NavigationField, cfg: AgentConfig) -> Vector:
-    agent = agents[index]
-    if not agent.active:
+def compute_evacuee_force(
+    evacuee: Evacuee,
+    actors: List[Actor],
+    floorplan: Floorplan,
+    field: NavigationField,
+    dynamic_obstacles: List[Body],
+    cfg: AgentConfig,
+) -> Vector:
+    if not evacuee.active:
         return np.zeros(3, dtype=float)
+
     force = np.zeros(3, dtype=float)
-    navigation_force = compute_navigation_force(agent, floorplan, field, cfg)
-    wall_force = compute_wall_force(agent, field, cfg)
-    ramp_edge_force = compute_ramp_edge_force(agent, floorplan, cfg)
+    navigation_force = _compute_navigation_force_for_evacuee(evacuee, floorplan, field, cfg)
+    wall_force = compute_wall_force(evacuee, field, cfg)
+    ramp_edge_force = compute_ramp_edge_force(evacuee, floorplan, cfg)
 
     nav_norm = norm(navigation_force[:2])
     wall_follow = np.zeros(3, dtype=float)
@@ -1451,41 +1694,91 @@ def compute_agent_force(index: int, agents: Sequence[Agent], floorplan: Floorpla
     force += wall_force
     force += wall_follow
     force += ramp_edge_force
-    force += compute_social_force(index, agents, floorplan, cfg)
+    force += _compute_social_force_for_evacuee(evacuee, actors, floorplan, cfg)
+
+    if dynamic_obstacles:
+        force += _compute_dynamic_obstacle_force(evacuee, dynamic_obstacles, cfg)
+
     return force
 
 
-def project_agent_to_walkable(agent: Agent, floorplan: Floorplan, field: NavigationField) -> None:
-    current_ramp = get_ramp_by_name(floorplan, agent.ramp_name)
+def _compute_social_force_for_evacuee(
+    evacuee: Evacuee,
+    actors: List[Actor],
+    floorplan: Floorplan,
+    cfg: AgentConfig,
+) -> Vector:
+    total = np.zeros(3, dtype=float)
+    for actor in actors:
+        if not isinstance(actor, Evacuee):
+            continue
+        if actor is evacuee or not actor.active or actor.reached_goal:
+            continue
+        delta = evacuee.pos - actor.pos
+        distance = norm(delta)
+        if distance < EPS or distance > max(cfg.social_range, actor.repulsion.range):
+            continue
+        weight = anisotropic_weight(actor.vel, evacuee.pos - actor.pos, actor.repulsion)
+        effective_range = max(0.25, actor.repulsion.range)
+        if distance >= effective_range:
+            continue
+        direction = unit(delta)
+        strength = cfg.social_strength * actor.repulsion.strength * weight
+        total += direction * strength * ((1.0 / max(distance, 0.1)) - (1.0 / effective_range)) / max(distance, 0.15)
+
+    if any(distance_point_to_aabb(evacuee.pos, g.min_corner, g.max_corner) <= 2.0 * evacuee.radius for g in floorplan.goals):
+        total *= 0.1
+    return total
+
+
+def _compute_dynamic_obstacle_force(evacuee: Evacuee, obstacles: List[Body], cfg: AgentConfig) -> Vector:
+    total = np.zeros(3, dtype=float)
+    for obs in obstacles:
+        delta = evacuee.pos - obs.pos
+        distance = norm(delta)
+        combined_radius = evacuee.radius + obs.radius
+        if distance < EPS or distance > max(cfg.social_range, combined_radius * 1.5):
+            continue
+        if distance >= combined_radius * 1.2:
+            continue
+        direction = unit(delta)
+        strength = cfg.social_strength * 1.5
+        clearance = max(distance - combined_radius, 0.1)
+        total += direction * strength * (1.0 / clearance)
+    return total
+
+
+def _project_evacuee_to_walkable(evacuee: Evacuee, floorplan: Floorplan, field: NavigationField) -> None:
+    current_ramp = get_ramp_by_name(floorplan, evacuee.ramp_name)
     if current_ramp is not None and point_near_ramp(
         current_ramp,
-        agent.pos[:2],
-        margin=max(agent.radius * 2.0, 0.2),
+        evacuee.pos[:2],
+        margin=max(evacuee.radius * 2.0, 0.2),
     ):
-        agent.pos[:2] = clamp_point_to_ramp(current_ramp, agent.pos[:2], agent.radius)
+        evacuee.pos[:2] = clamp_point_to_ramp(current_ramp, evacuee.pos[:2], evacuee.radius)
         return
 
-    if is_xy_walkable_on_floor(floorplan, agent.floor_index, agent.pos[:2]):
+    if is_xy_walkable_on_floor(floorplan, evacuee.floor_index, evacuee.pos[:2]):
         return
-    snapped_xy = nearest_walkable_xy(field, agent.floor_index, agent.pos[:2])
-    agent.pos[:2] = snapped_xy
-    agent.vel[:2] *= 0.25
+    snapped_xy = nearest_walkable_xy(field, evacuee.floor_index, evacuee.pos[:2])
+    evacuee.pos[:2] = snapped_xy
+    evacuee.vel[:2] *= 0.25
 
 
-def update_agent_surface(agent: Agent, floorplan: Floorplan, field: NavigationField) -> None:
-    xy = agent.pos[:2]
-    ramp = get_ramp_by_name(floorplan, agent.ramp_name)
-    if ramp is not None and not point_near_ramp(ramp, xy, margin=max(agent.radius * 2.0, 0.2)):
+def _update_evacuee_surface(evacuee: Evacuee, floorplan: Floorplan, field: NavigationField) -> None:
+    xy = evacuee.pos[:2]
+    ramp = get_ramp_by_name(floorplan, evacuee.ramp_name)
+    if ramp is not None and not point_near_ramp(ramp, xy, margin=max(evacuee.radius * 2.0, 0.2)):
         ramp = None
 
     if ramp is None:
-        for candidate in ramps_toward_goal_for_floor(floorplan, agent.floor_index, field.goal_floor):
-            if not can_enter_ramp_from_floor(candidate, field.goal_floor, agent.floor_index, xy):
+        for candidate in ramps_toward_goal_for_floor(floorplan, evacuee.floor_index, field.goal_floor):
+            if not can_enter_ramp_from_floor(candidate, field.goal_floor, evacuee.floor_index, xy):
                 continue
             if point_in_polygon(xy, candidate.polygon) or point_near_ramp(
                 candidate,
                 xy,
-                margin=max(agent.radius * 1.5, 0.15),
+                margin=max(evacuee.radius * 1.5, 0.15),
             ):
                 ramp = candidate
                 break
@@ -1493,25 +1786,25 @@ def update_agent_surface(agent: Agent, floorplan: Floorplan, field: NavigationFi
     if ramp is not None:
         travel = get_ramp_travel_for_goal(ramp, field.goal_floor)
         if travel is None:
-            agent.ramp_name = None
+            evacuee.ramp_name = None
             return
         _, _, exit_floor, exit_xy, _ = travel
-        agent.pos[:2] = clamp_point_to_ramp(ramp, xy, agent.radius)
-        xy = agent.pos[:2]
-        agent.ramp_name = ramp.name
+        evacuee.pos[:2] = clamp_point_to_ramp(ramp, xy, evacuee.radius)
+        xy = evacuee.pos[:2]
+        evacuee.ramp_name = ramp.name
         high_floor = ramp.from_floor if ramp.start[2] >= ramp.end[2] else ramp.to_floor
         low_floor = ramp.to_floor if high_floor == ramp.from_floor else ramp.from_floor
         _, t = closest_point_on_segment_2d(xy, ramp.start[:2], ramp.end[:2])
-        agent.floor_index = high_floor if t < 0.5 else low_floor
-        agent.pos[2] = ramp_height_at_xy(ramp, xy) + agent.radius
+        evacuee.floor_index = high_floor if t < 0.5 else low_floor
+        evacuee.pos[2] = ramp_height_at_xy(ramp, xy) + evacuee.radius
         if norm(xy - exit_xy) <= max(ramp.width * 0.4, 0.55):
-            agent.floor_index = exit_floor
-            agent.ramp_name = None
+            evacuee.floor_index = exit_floor
+            evacuee.ramp_name = None
         return
 
-    floor = floorplan.floors[agent.floor_index]
+    floor = floorplan.floors[evacuee.floor_index]
     if not point_in_polygon(xy, floor.polygon):
-        best_floor = agent.floor_index
+        best_floor = evacuee.floor_index
         best_distance = INF
         for candidate in floorplan.floors:
             snapped = nearest_walkable_xy(field, candidate.index, xy)
@@ -1519,40 +1812,10 @@ def update_agent_surface(agent: Agent, floorplan: Floorplan, field: NavigationFi
             if dist < best_distance:
                 best_distance = dist
                 best_floor = candidate.index
-        agent.floor_index = best_floor
+        evacuee.floor_index = best_floor
         floor = floorplan.floors[best_floor]
-    agent.ramp_name = None
-    agent.pos[2] = floor.surface_z + agent.radius
-
-
-def step_simulation(agents: List[Agent], floorplan: Floorplan, field: NavigationField, cfg: AgentConfig, dt: float) -> None:
-    forces = [compute_agent_force(i, agents, floorplan, field, cfg) for i in range(len(agents))]
-    for agent, force in zip(agents, forces):
-        if not agent.active:
-            continue
-
-        desired_velocity = force
-        agent.vel = (1.0 - cfg.damping) * agent.vel + cfg.damping * desired_velocity
-        speed = norm(agent.vel)
-        if speed > cfg.max_speed:
-            agent.vel *= cfg.max_speed / speed
-
-        agent.pos[:2] += agent.vel[:2] * dt
-        agent.pos[0] = clamp(agent.pos[0], floorplan.bounds_min[0], floorplan.bounds_max[0])
-        agent.pos[1] = clamp(agent.pos[1], floorplan.bounds_min[1], floorplan.bounds_max[1])
-        project_agent_to_walkable(agent, floorplan, field)
-        update_agent_surface(agent, floorplan, field)
-
-        if any(distance_point_to_aabb(agent.pos, g.min_corner, g.max_corner) <= agent.radius for g in floorplan.goals):
-            agent.reached_goal = True
-            agent.active = False
-            agent.vel[:] = 0.0
-            for goal in floorplan.goals:
-                if distance_point_to_aabb(agent.pos, goal.min_corner, goal.max_corner) <= agent.radius:
-                    goal_center = goal.center.copy()
-                    goal_center[2] = max(goal_center[2], goal.min_corner[2] + agent.radius)
-                    agent.pos[:] = goal_center
-                    break
+    evacuee.ramp_name = None
+    evacuee.pos[2] = floor.surface_z + evacuee.radius
 
 
 def create_mesh_actor(vertices: List[List[float]], faces: List[List[int]], color: str, alpha: float):
@@ -1624,38 +1887,24 @@ def build_scene(floorplan: Floorplan):
     return actors
 
 
-def run_simulation_without_render(
-    floorplan: Floorplan,
-    scenario: Scenario,
-    agents: List[Agent],
-    field: NavigationField,
-) -> None:
-    for _ in range(scenario.simulation.steps):
-        step_simulation(
-            agents,
-            floorplan,
-            field,
-            scenario.agent_defaults,
-            scenario.simulation.dt,
-        )
-
-    active = sum(1 for agent in agents if agent.active)
-    reached = sum(1 for agent in agents if agent.reached_goal)
-    print(
-        f"Headless run complete: steps={scenario.simulation.steps} active={active} reached={reached}"
-    )
+def run_simulator(sim: Simulator) -> None:
+    sim.run()
+    print(f"Simulation complete: steps={sim.step_count} active={sim.active_count} reached={sim.reached_count}")
 
 
-def render_simulation(
-    floorplan: Floorplan,
-    scenario: Scenario,
-    agents: List[Agent],
-    field: NavigationField,
-    output_video: Optional[str],
-    offscreen: bool,
+def _get_evacuees(sim: Simulator) -> List:
+    if sim._env is not None:
+        return sim._env.evacuees
+    return sim._agents if sim._agents else []
+
+
+def render_simulator(
+    sim: Simulator,
+    output_video: Optional[str] = None,
+    offscreen: bool = False,
 ) -> None:
     if offscreen and output_video is None:
-        run_simulation_without_render(floorplan, scenario, agents, field)
+        run_simulator(sim)
         return
 
     try:
@@ -1668,15 +1917,16 @@ def render_simulation(
     def signal_handler(signum, frame):
         nonlocal interrupted
         interrupted = True
+        sim.interrupt()
 
     import signal
     old_handler = signal.signal(signal.SIGINT, signal_handler)
 
-    plotter = Plotter(title=floorplan.name, size=(1280, 900))
-    plotter.show(*build_scene(floorplan), interactive=False, resetcam=True)
+    plotter = Plotter(title=sim.floorplan.name, size=(1280, 900))
+    plotter.show(*build_scene(sim.floorplan), interactive=False, resetcam=True)
 
-    center = 0.5 * (floorplan.bounds_min + floorplan.bounds_max)
-    scene_size = floorplan.bounds_max - floorplan.bounds_min
+    center = 0.5 * (sim.floorplan.bounds_min + sim.floorplan.bounds_max)
+    scene_size = sim.floorplan.bounds_max - sim.floorplan.bounds_min
     max_dim = float(np.max(scene_size))
     cam_pos = center + np.array([1.25, 1.2, 1.0], dtype=float) * max_dim
     plotter.camera.SetPosition(cam_pos.tolist())
@@ -1687,9 +1937,10 @@ def render_simulation(
     plotter.reset_clipping_range()
     plotter.render()
 
+    evacuees = _get_evacuees(sim)
     sphere_actors = []
-    for agent in agents:
-        actor = Sphere(pos=agent.pos, r=agent.radius, c=agent.color)
+    for evacuee in evacuees:
+        actor = Sphere(pos=evacuee.pos, r=evacuee.radius, c=evacuee.color)
         actor.alpha(0.95)
         sphere_actors.append(actor)
     if sphere_actors:
@@ -1700,18 +1951,16 @@ def render_simulation(
 
     writer = None
     if output_video:
-        writer = Video(output_video, fps=max(1, int(round(1.0 / scenario.simulation.dt))))
+        writer = Video(output_video, fps=max(1, int(round(1.0 / sim.dt))))
 
-    for step in range(scenario.simulation.steps):
+    while not sim.is_finished:
         if interrupted:
             break
-        step_simulation(agents, floorplan, field, scenario.agent_defaults, scenario.simulation.dt)
-        for actor, agent in zip(sphere_actors, agents):
-            actor.pos(agent.pos)
-            actor.alpha(0.35 if agent.reached_goal else 0.95)
-        active = sum(1 for agent in agents if agent.active)
-        reached = sum(1 for agent in agents if agent.reached_goal)
-        status.text(f"step {step + 1}/{scenario.simulation.steps}   active: {active}   reached: {reached}")
+        sim.step()
+        for actor, evacuee in zip(sphere_actors, _get_evacuees(sim)):
+            actor.pos(evacuee.pos)
+            actor.alpha(0.35 if evacuee.reached_goal else 0.95)
+        status.text(f"step {sim.step_count}/{sim.total_steps}   active: {sim.active_count}   reached: {sim.reached_count}")
         plotter.render()
         if writer is not None:
             writer.add_frame()
@@ -1912,13 +2161,12 @@ def main() -> None:
     np.random.seed(scenario.simulation.seed)
 
     field = build_navigation_field(floorplan, scenario)
-    agents = initialize_agents(scenario, floorplan, field)
+    env = create_environment(scenario, floorplan, field)
 
-    render_simulation(
-        floorplan=floorplan,
-        scenario=scenario,
-        agents=agents,
-        field=field,
+    sim = Simulator(floorplan=floorplan, scenario=scenario, env=env)
+
+    render_simulator(
+        sim=sim,
         output_video=args.video,
         offscreen=scenario.simulation.offscreen,
     )
