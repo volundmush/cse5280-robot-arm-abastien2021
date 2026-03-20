@@ -218,7 +218,7 @@
     {
       "count": 1,
       "floor": 0,
-      "offset": [5.0, 3.0],
+      "offset": [15.0, 3.0],
       "color": "darkred",
       "strength": 8.0,
       "radius": 0.35,

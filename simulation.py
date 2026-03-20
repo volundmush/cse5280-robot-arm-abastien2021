@@ -97,6 +97,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+from robot import prepare_robot, RobotArm
 
 Vector = np.ndarray
 Polygon2D = np.ndarray
@@ -469,129 +470,108 @@ class Evacuee(Actor):
         self.ramp_name = None
 
 
-class Harasser(Actor):
+class Harasser(RobotArm, Actor):
     def __init__(
         self,
-        pos: Vector,
-        vel: Vector,
+        partLengths: List[float],
+        mesh_scale: float,
+        arm_location: Vector,
         floor_index: int,
         radius: float,
         color: str,
         strength: float = 5.0,
         strategy: str = "intercept",
     ):
-        super().__init__()
-        self.pos = pos.copy()
-        self.vel = vel
+        RobotArm.__init__(self, partLengths, arm_location, mesh_scale)
+        Actor.__init__(self)
         self.floor_index = floor_index
         self.radius = radius
         self.color = color
         self.strength = strength
         self.strategy = strategy
-        self._bodies = [Body(pos=self.pos, radius=radius, owner_id=self.id)]
-        self._target_pos = self.pos[:2].copy()
+        self._target_pos = self.arm_location.flatten()[:2].copy()
+        self._phi = np.array([0.0, 0.0, 0.0, 0.0])
+        _, _, _, _, _, ee_pos = self.forward_kinematics(self._phi)
+        self._bodies = [Body(pos=ee_pos.copy(), radius=radius, owner_id=self.id)]
 
     @property
-    def x(self) -> float:
-        return float(self.pos[0])
-
-    @property
-    def y(self) -> float:
-        return float(self.pos[1])
-
-    @property
-    def z(self) -> float:
-        return float(self.pos[2])
+    def pos(self) -> np.ndarray:
+        return self._bodies[0].pos
 
     def _compute_target_nearest(self, evacuees: List["Evacuee"]) -> np.ndarray:
-        nearest = min(evacuees, key=lambda e: norm(self.pos[:2] - e.pos[:2]))
+        nearest = min(evacuees, key=lambda e: norm(self._bodies[0].pos[:2] - e.pos[:2]))
         return nearest.pos[:2].copy()
 
     def _compute_target_density(self, evacuees: List["Evacuee"], env: Environment) -> np.ndarray:
-        return _find_highest_density_point(evacuees, env.floorplan, self.pos)
+        return _find_highest_density_point(evacuees, env.floorplan, self._bodies[0].pos)
 
     def _compute_target_flow(self, evacuees: List["Evacuee"], env: Environment) -> np.ndarray:
-        return _compute_flow_target(evacuees, self.pos, env.floorplan, prediction_time=2.0)
+        return _compute_flow_target(evacuees, self._bodies[0].pos, env.floorplan, prediction_time=2.0)
 
     def _compute_target_intercept(self, evacuees: List["Evacuee"], env: Environment) -> np.ndarray:
         clusters = _find_evacuee_clusters(evacuees)
         if not clusters:
             return self._compute_target_nearest(evacuees)
-
         best_target = None
         best_score = -1.0
-
         for centroid, velocity, size in clusters:
             predicted_pos = centroid + velocity * 2.0
             min_dist = min(norm(predicted_pos - g.center[:2]) for g in env.floorplan.goals)
             urgency = 1.0 / max(min_dist, 0.5)
             score = float(size) * urgency
-
             if score > best_score:
                 best_score = score
                 best_target = predicted_pos
-
-        return best_target if best_target is not None else self.pos[:2].copy()
+        return best_target if best_target is not None else self._bodies[0].pos[:2].copy()
 
     def _compute_target(self, evacuees: List["Evacuee"], env: Environment) -> np.ndarray:
-        if not evacuees:
-            return self.pos[:2].copy()
-
+        floor_evacuees = [e for e in evacuees if e.floor_index == self.floor_index]
+        if not floor_evacuees:
+            return self._bodies[0].pos[:2].copy()
         if self.strategy == "nearest":
-            return self._compute_target_nearest(evacuees)
+            return self._compute_target_nearest(floor_evacuees)
         elif self.strategy == "density":
-            return self._compute_target_density(evacuees, env)
+            return self._compute_target_density(floor_evacuees, env)
         elif self.strategy == "flow":
-            return self._compute_target_flow(evacuees, env)
+            return self._compute_target_flow(floor_evacuees, env)
         elif self.strategy == "intercept":
-            return self._compute_target_intercept(evacuees, env)
+            return self._compute_target_intercept(floor_evacuees, env)
         else:
-            return self._compute_target_nearest(evacuees)
+            return self._compute_target_nearest(floor_evacuees)
+
+    def solve_ik(self, target_xy: np.ndarray, max_iterations: int = 50) -> np.ndarray:
+        self.target = np.array([target_xy[0], target_xy[1], self.arm_location[2, 0]], dtype=float)
+        phi = self._phi.copy()
+        _, _, _, _, _, e = self.forward_kinematics(phi)
+        for _ in range(max_iterations):
+            J = self.jacobian_matrix(phi)
+            J_pinv = np.linalg.pinv(J)
+            e_delta = self.target_lambda * (self.target - e)
+            phi_delta = J_pinv @ e_delta
+            phi_delta = np.append(phi_delta, [0.0])
+            phi = phi + phi_delta
+            _, _, _, _, _, e = self.forward_kinematics(phi)
+            if norm(self.target - e) < self.target_tolerance:
+                break
+        return phi
 
     def force(self, env: Environment, cfg: AgentConfig) -> Vector:
-        evacuees = [a for a in env.actors if isinstance(a, Evacuee) and a.active and not a.reached_goal and a.floor_index == self.floor_index]
-        if not evacuees:
-            return np.zeros(3, dtype=float)
-
-        self._target_pos = self._compute_target(evacuees, env)
-
-        delta = self._target_pos - self.pos[:2]
-        dist = norm(delta)
-        if dist < EPS:
-            return np.zeros(3, dtype=float)
-
-        attraction = unit(delta) * self.strength
-
-        ramp_repulsion = _compute_ramp_underside_repulsion(self.pos, env.floorplan)
-
-        total = np.zeros(3, dtype=float)
-        total[:2] = attraction + ramp_repulsion[:2]
-        return total
+        evacuees = [a for a in env.actors if isinstance(a, Evacuee) and a.active and not a.reached_goal]
+        target_xy = self._compute_target(evacuees, env)
+        self._phi = self.solve_ik(target_xy)
+        return np.zeros(3, dtype=float)
 
     def step(self, env: Environment, cfg: AgentConfig, dt: float) -> None:
         if not self.active:
             return
-
-        force_vec = self.force(env, cfg)
-        self.vel = (1.0 - cfg.damping) * self.vel + cfg.damping * force_vec
-        speed = norm(self.vel)
-        if speed > cfg.max_speed:
-            self.vel *= cfg.max_speed / speed
-
-        self.pos[:2] += self.vel[:2] * dt
-        self.pos[0] = clamp(self.pos[0], env.floorplan.bounds_min[0], env.floorplan.bounds_max[0])
-        self.pos[1] = clamp(self.pos[1], env.floorplan.bounds_min[1], env.floorplan.bounds_max[1])
-
-        if not is_xy_walkable_on_floor(env.floorplan, self.floor_index, self.pos[:2]):
-            self.pos[:2] = nearest_walkable_xy(env.field, self.floor_index, self.pos[:2])
-        current_floor = env.floorplan.floors[self.floor_index]
-        self.pos[2] = current_floor.surface_z + self.radius
-
-        self._bodies[0].pos[:] = self.pos
+        self.force(env, cfg)
+        _, _, _, _, _, ee_pos = self.forward_kinematics(self._phi)
+        self._bodies[0].pos[:] = ee_pos
+        self.meshes = self.update_pose(self._phi)
 
     def reset(self) -> None:
-        super().reset()
-        self.vel[:] = 0.0
+        Actor.reset(self)
+        self._phi = np.array([0.0, 0.0, 0.0, 0.0])
 
 
 @dataclass
@@ -1689,16 +1669,24 @@ def create_environment(
     evacuees = initialize_evacuees(scenario, floorplan, field)
     for evacuee in evacuees:
         env.add_actor(evacuee)
+    unit = 1
+    mesh_scale = 0.018
+    BaseH = 105 * mesh_scale / unit
+    BaseRotH = 81 * mesh_scale / unit
+    HumerusH = 217 * mesh_scale / unit
+    RadiusH = 416 * mesh_scale / unit
+    L = [BaseRotH, HumerusH, RadiusH, 0]
     for harasser_group in scenario.harassers:
         floor = floorplan.floors[harasser_group.floor]
         for _ in range(harasser_group.count):
-            center_x = floor.bbox[0] + harasser_group.offset[0]
-            center_y = floor.bbox[2] + harasser_group.offset[1]
-            center_z = floor.surface_z + harasser_group.radius
-            pos = np.array([center_x, center_y, center_z], dtype=float)
+            arm_x = floor.bbox[0] - 1.0
+            arm_y = floor.bbox[2] - 1.0
+            arm_z = floor.surface_z
+            arm_location = np.array([[arm_x], [arm_y], [arm_z]], dtype=float)
             harasser = Harasser(
-                pos=pos,
-                vel=np.zeros(3, dtype=float),
+                partLengths=L,
+                mesh_scale=mesh_scale,
+                arm_location=arm_location,
                 floor_index=harasser_group.floor,
                 radius=harasser_group.radius,
                 color=harasser_group.color,
@@ -2426,6 +2414,7 @@ def render_simulator(
     harassers = sim._env.harassers if sim._env else []
     harasser_actors = []
     target_actors = []
+    robot_arm_mesh_actors = []
     for harasser in harassers:
         actor = Sphere(pos=harasser.pos, r=harasser.radius, c=harasser.color)
         actor.alpha(0.95)
@@ -2433,10 +2422,15 @@ def render_simulator(
         target = Sphere(pos=harasser.pos, r=0.3, c="red")
         target.alpha(0.5)
         target_actors.append(target)
+        if harasser.meshes:
+            for mesh in harasser.meshes:
+                robot_arm_mesh_actors.append(mesh)
     if harasser_actors:
         plotter.add(*harasser_actors)
     if target_actors:
         plotter.add(*target_actors)
+    if robot_arm_mesh_actors:
+        plotter.add(*robot_arm_mesh_actors)
 
     status = Text2D("", pos="top-left", c="white", font="Courier", s=0.8)
     plotter.add(status)
@@ -2456,6 +2450,14 @@ def render_simulator(
             actor.alpha(0.35 if evacuee.reached_goal else 0.95)
         for actor, harasser in zip(harasser_actors, sim._env.harassers if sim._env else []):
             actor.pos(harasser.pos)
+        if robot_arm_mesh_actors:
+            plotter.remove(*robot_arm_mesh_actors)
+            robot_arm_mesh_actors.clear()
+        for harasser in sim._env.harassers if sim._env else []:
+            if harasser.meshes:
+                for mesh in harasser.meshes:
+                    plotter.add(mesh)
+                    robot_arm_mesh_actors.append(mesh)
         for target_actor, harasser in zip(target_actors, sim._env.harassers if sim._env else []):
             target_pos = harasser._target_pos
             target_actor.pos([target_pos[0], target_pos[1], harasser.pos[2] + 0.5])
@@ -2640,6 +2642,8 @@ def main() -> None:
     if not args.scenario:
         print("Please provide --scenario, or use --make-example-data.")
         return
+
+    prepare_robot()
 
     floorplan = load_floorplan(args.scenario)
     scenario = load_scenario(args.scenario, floorplan.floors)
