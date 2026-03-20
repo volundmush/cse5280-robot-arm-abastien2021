@@ -5,3 +5,4 @@ tmp/
 .vscode/
 robot/
 *.npy
+*.ipynb
