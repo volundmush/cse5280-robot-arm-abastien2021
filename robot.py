@@ -38,8 +38,8 @@ class RobotArm:
         # Constants
         self.delta_phi = 0.1              # finite-difference step, in degrees
         self.target = np.array([0, 100, 200], dtype=float)
-        self.target_tolerance = 30
-        self.target_lambda = 0.001
+        self.target_tolerance = 0.05
+        self.target_lambda = 0.05
         self.convergence = 0.02
         self.iteration_limit = 1000
 

@@ -222,7 +222,8 @@
       "color": "darkred",
       "strength": 8.0,
       "radius": 0.35,
-      "strategy": "intercept"
+      "strategy": "intercept",
+      "base_position": [9.0, 0.0]
     },
     {
       "count": 1,
@@ -231,7 +232,8 @@
       "color": "purple",
       "strength": 8.0,
       "radius": 0.35,
-      "strategy": "flow"
+      "strategy": "flow",
+      "base_position": [12.0, 13.0]
     }
   ]
 }

@@ -244,6 +244,7 @@ class HarasserGroup:
     strength: float
     radius: float
     strategy: str = "intercept"
+    base_position: Optional[List[float]] = None  # [x, y] for robot arm base position
 
 
 @dataclass
@@ -539,8 +540,8 @@ class Harasser(RobotArm, Actor):
         else:
             return self._compute_target_nearest(floor_evacuees)
 
-    def solve_ik(self, target_xy: np.ndarray, max_iterations: int = 50) -> np.ndarray:
-        self.target = np.array([target_xy[0], target_xy[1], self.arm_location[2, 0]], dtype=float)
+    def solve_ik(self, target_xy: np.ndarray, target_z: float, max_iterations: int = 200) -> np.ndarray:
+        self.target = np.array([target_xy[0], target_xy[1], target_z], dtype=float)
         phi = self._phi.copy()
         _, _, _, _, _, e = self.forward_kinematics(phi)
         for _ in range(max_iterations):
@@ -558,7 +559,8 @@ class Harasser(RobotArm, Actor):
     def force(self, env: Environment, cfg: AgentConfig) -> Vector:
         evacuees = [a for a in env.actors if isinstance(a, Evacuee) and a.active and not a.reached_goal]
         target_xy = self._compute_target(evacuees, env)
-        self._phi = self.solve_ik(target_xy)
+        target_z = env.floorplan.floors[self.floor_index].surface_z + 0.5
+        self._phi = self.solve_ik(target_xy, target_z)
         return np.zeros(3, dtype=float)
 
     def step(self, env: Environment, cfg: AgentConfig, dt: float) -> None:
@@ -1181,6 +1183,7 @@ def load_scenario(spec: str, floors: List[Floor]) -> Scenario:
         strategy = raw.get("strategy", "intercept")
         if strategy not in HARASSER_STRATEGIES:
             strategy = "intercept"
+        base_position = raw.get("base_position")
         harassers.append(
             HarasserGroup(
                 count=int(raw.get("count", 1)),
@@ -1190,6 +1193,7 @@ def load_scenario(spec: str, floors: List[Floor]) -> Scenario:
                 strength=float(raw.get("strength", 5.0)),
                 radius=float(raw.get("radius", 0.3)),
                 strategy=strategy,
+                base_position=base_position,
             )
         )
 
@@ -1670,8 +1674,7 @@ def create_environment(
     for evacuee in evacuees:
         env.add_actor(evacuee)
     unit = 1
-    mesh_scale = 0.018
-    BaseH = 105 * mesh_scale / unit
+    mesh_scale = 0.025
     BaseRotH = 81 * mesh_scale / unit
     HumerusH = 217 * mesh_scale / unit
     RadiusH = 416 * mesh_scale / unit
@@ -1679,9 +1682,13 @@ def create_environment(
     for harasser_group in scenario.harassers:
         floor = floorplan.floors[harasser_group.floor]
         for _ in range(harasser_group.count):
-            arm_x = floor.bbox[0] - 1.0
-            arm_y = floor.bbox[2] - 1.0
-            arm_z = floor.surface_z
+            if harasser_group.base_position is not None:
+                arm_x = harasser_group.base_position[0]
+                arm_y = harasser_group.base_position[1]
+            else:
+                arm_x = floor.bbox[0] - 1.0
+                arm_y = floor.bbox[2] - 1.0
+            arm_z = floorplan.floors[0].surface_z  # Base always at floor 0
             arm_location = np.array([[arm_x], [arm_y], [arm_z]], dtype=float)
             harasser = Harasser(
                 partLengths=L,
